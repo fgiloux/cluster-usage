@@ -23,8 +23,8 @@ import (
 	"sync"
 	"time"
 
-	"fgiloux/controller-tools/pkg/cluster/usage"
-	"fgiloux/controller-tools/pkg/cluster/usage/informerfactory"
+	"github.com/fgiloux/cluster-usage/pkg/cluster/usage"
+	"github.com/fgiloux/cluster-usage/pkg/cluster/usage/informerfactory"
 
 	"k8s.io/klog/v2"
 
@@ -36,7 +36,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	// utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/util/sets"
 
 	// "k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/discovery"
@@ -56,30 +55,20 @@ type ResyncPeriodFunc func() time.Duration
 // ResourcesFunc knows how to discover resources.
 type ResourcesFunc func() ([]*metav1.APIResourceList, error)
 
-// type NamespacedResourcesFunc func() ([]*metav1.APIResourceList, error)
-
 // ReplenishmentFunc is a signal that a resource changed in specified namespace
 // that may require usage to be recalculated.
 type ReplenishmentFunc func(groupResource schema.GroupResource, namespace string)
 
 // ControllerOptions holds options for creating a usage controller
 type ControllerOptions struct {
-	// Must have authority to list all quotas, and update quota status
-	// QuotaClient corev1client.ResourceQuotasGetter
-	// Shared informer for resource quotas
-	// ResourceQuotaInformer coreinformers.ResourceQuotaInformer
-	// Controls full recalculation of quota usage
+	// Shared informer for resource usage
+	// ResourceUsageInformer coreinformers.ResourceUsageInformer
+	// Controls full recalculation of resource usage
 	ResyncPeriod ResyncPeriodFunc
-	// Maintains evaluators that know how to calculate usage for group resource
+	// Maintains evaluators that know how to calculate usage for GroupResources
+	// If no evaluator is found for a GroupResource the default one is added to the registry
 	Registry usage.Registry
 	// Discover the list of supported resources on the server, whose usage may get tracked
-	// FGI TODO: I need to check what is passed through the controller options. It will need to be amended. At the end of the day what is required
-	// - Get a list of resource group, kind (statically configurable unlike quota)
-	// - Check that the APIs exist and return the matches
-	// - Unlike quota I may not want to limit to namespaced resources
-	// This is initialised here: https://github.com/kubernetes/kubernetes/blob/master/cmd/kube-controller-manager/app/core.go#L419
-	// resourceQuotaControllerDiscoveryClient.ServerPreferredNamespacedResources
-	// DiscoveryFunc NamespacedResourcesFunc
 	DiscoveryFunc ResourcesFunc
 	// A function that returns the list of resources to ignore
 	// IgnoredResourcesFunc func() map[schema.GroupResource]struct{}
@@ -90,31 +79,27 @@ type ControllerOptions struct {
 	// Controls full resync of objects monitored for replenishment.
 	ReplenishmentResyncPeriod ResyncPeriodFunc
 	// UsageRequests contains the usage tracking requests with related filters and notifications
+	// FGI TODO: I may want to make the usage requests independent of the setup. In that case
+	// I would not filter in the discovery phase
 	UsageRequests []usage.UsageRequest
 }
 
 // Controller is responsible for tracking usage in the system
 type Controller struct {
-	// Must have authority to list all resources in the system
-	// rqClient corev1client.ResourceQuotasGetter
-	// A lister/getter of resource quota objects
-	// rqLister corelisters.ResourceQuotaLister
 	// A list of functions that return true when their caches have synced
+	// FGI: is it needed?
 	informerSyncedFuncs []cache.InformerSynced
 	// Resource objects that need to be synchronized
 	queue workqueue.RateLimitingInterface
-	// missingUsageQueue holds objects that are missing the initial usage information
-	// FGI TODO: we may not need it. This is called when a quota is added but our list is static
-	// missingUsageQueue workqueue.RateLimitingInterface
 	// To allow injection of syncUsage for testing.
-	// FGI TODO
 	syncHandler func(key string) error
 	// function that controls full recalculation of quota usage
 	resyncPeriod ResyncPeriodFunc
 	// knows how to calculate usage
 	registry usage.Registry
 	// knows how to monitor all the resources tracked and trigger replenishment
-	usageMonitor *UsageMonitor
+	// FGI: TODO NEXT
+	// usageMonitor *UsageMonitor
 	// controls the workers that process usage
 	// this lock is acquired to control write access to the monitors and ensures that all
 	// monitors are synced before the controller can report usage.
@@ -124,88 +109,69 @@ type Controller struct {
 // New creates a usage controller with specified options
 func New(options *ControllerOptions) (*Controller, error) {
 	// build the resource usage controller
-	rc := &Controller{
-		// rqClient:            options.QuotaClient,
-		// rqLister:            options.ResourceQuotaInformer.Lister(),
+	var registry usage.Registry
+	if options.Registry != nil {
+		registry = options.Registry
+	} else {
+		// FGI TODO
+		// registry :=
+	}
+
+	uc := &Controller{
 		// informerSyncedFuncs: []cache.InformerSynced{options.ResourceQuotaInformer.Informer().HasSynced},
 		informerSyncedFuncs: []cache.InformerSynced{},
-		queue:               workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "resource_primary"),
-		// missingUsageQueue:   workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "resource_priority"),
-		resyncPeriod: options.ResyncPeriod,
-		registry:     options.Registry,
+		queue:               workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "resource_usage"),
+		resyncPeriod:        options.ResyncPeriod,
+		registry:            registry,
 	}
 	// set the synchronization handler
-	rc.syncHandler = rc.syncResourceUsageFromKey
+	uc.syncHandler = uc.syncResourceUsageFromKey
 
-	// FGI: not reconciliating any resource
-	// TODO: may need to be removed
-	/* options.ResourceQuotaInformer.Informer().AddEventHandlerWithResyncPeriod(
-		cache.ResourceEventHandlerFuncs{
-			AddFunc: rc.addQuota,
-			UpdateFunc: func(old, cur interface{}) {
-				// We are only interested in observing updates to quota.spec to drive updates to quota.status.
-				// We ignore all updates to quota.Status because they are all driven by this controller.
-				// IMPORTANT:
-				// We do not use this function to queue up a full quota recalculation.  To do so, would require
-				// us to enqueue all quota.Status updates, and since quota.Status updates involve additional queries
-				// that cannot be backed by a cache and result in a full query of a namespace's content, we do not
-				// want to pay the price on spurious status updates.  As a result, we have a separate routine that is
-				// responsible for enqueue of all resource quotas when doing a full resync (enqueueAll)
-				oldResourceQuota := old.(*v1.ResourceQuota)
-				curResourceQuota := cur.(*v1.ResourceQuota)
-				if quota.Equals(oldResourceQuota.Spec.Hard, curResourceQuota.Spec.Hard) {
-					return
-				}
-				rq.addQuota(curResourceQuota)
-			},
-			// This will enter the sync loop and no-op, because the controller has been deleted from the store.
-			// Note that deleting a controller immediately after scaling it to 0 will not work. The recommended
-			// way of achieving this is by performing a `stop` operation on the controller.
-			DeleteFunc: rq.enqueueResourceQuota,
-		},
-		rq.resyncPeriod(),
-	)*/
-
-	if options.DiscoveryFunc != nil {
+	// FGI TODO NEXT
+	/*
 		um := &UsageMonitor{
 			informersStarted: options.InformersStarted,
 			informerFactory:  options.InformerFactory,
-			// ignoredResources: options.IgnoredResourcesFunc(),
 			resourceChanges: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "resource_usage_controller_resource_changes"),
 			resyncPeriod:    options.ReplenishmentResyncPeriod,
-			replenishment:   rc.replenishUsage,
-			registry:        rc.registry,
+			replenishment:   uc.replenishUsage,
+			registry:        uc.registry,
 		}
-		rc.usageMonitor = um
+		uc.usageMonitor = um
+	*/
 
-		// do initial quota monitor setup.  If we have a discovery failure here, it's ok. We'll discover more resources when a later sync happens.
-		// FGI TODO: I need to look at the resync aspect
-		resSubset, mappings, err := GetMonitorableResources(options.DiscoveryFunc, options.UsageRequests)
-		if discovery.IsGroupDiscoveryFailedError(err) {
-			utilruntime.HandleError(fmt.Errorf("discovery check failure, continuing and counting on future sync update: %v", err))
-		} else if err != nil {
-			return nil, err
-		}
-		um.usageRequests = resSubset
-		um.grgvrMapping = mappings
-		// um.measurers = map[schema.GroupResource]usage.Measurer{}
-		if err = um.SyncMonitors(); err != nil {
-			utilruntime.HandleError(fmt.Errorf("initial monitor sync has error: %v", err))
-		}
-
-		// only start quota once all informers synced
-		// FGI TODO: we don't have a quota resource
-		//rq.informerSyncedFuncs = append(rq.informerSyncedFuncs, qm.IsSynced)
+	// do initial usage monitor setup.  If we have a discovery failure here, it's ok. We'll discover more resources when a later sync happens.
+	// DiscoveryFunc should default to: DiscoveryClient.ServerPreferredResources from client-go discovery package
+	// https://github.com/kubernetes/client-go/blob/master/discovery/discovery_client.go#L387
+	// resSubset, mappings, err := GetMonitorableResources(options.DiscoveryFunc, options.UsageRequests)
+	_, mappings, err := GetMonitorableResources(options.DiscoveryFunc, options.UsageRequests)
+	// FGI TODO: testing
+	klog.Infof("Cluster versions of monitored resources %+v", mappings)
+	if discovery.IsGroupDiscoveryFailedError(err) {
+		utilruntime.HandleError(fmt.Errorf("discovery check failure, continuing and counting on future sync update: %v", err))
+	} else if err != nil {
+		return nil, err
 	}
+	// FGI TODO NEXT
+	// um.usageRequests = resSubset
+	// um.grgvrMapping = mappings
+	//// um.measurers = map[schema.GroupResource]usage.Measurer{}
+	// if err = um.SyncMonitors(); err != nil {
+	// utilruntime.HandleError(fmt.Errorf("initial monitor sync has error: %v", err))
+	//}
 
-	return rc, nil
+	// only start quota once all informers synced
+	// FGI TODO: we don't have a quota resource
+	//rq.informerSyncedFuncs = append(rq.informerSyncedFuncs, qm.IsSynced)
+
+	return uc, nil
 }
 
 // enqueueAll is called at the fullResyncPeriod interval to force a full recalculation of usage statistics
 // FGI TODO: this is not doing anything currently. The enqueue would need to be done based on the resources tracked
 // rather than quotas
 func (rc *Controller) enqueueAll() {
-	defer klog.V(4).Infof("Resource usage controller queued all resource checks for full calculation of usage")
+	defer klog.V(4).Info("Resource usage controller queued all resource checks for full calculation of usage")
 	// FGI the key should contain: namespace & GroupResource
 	// rqs, err := rc.rqLister.List(labels.Everything())
 	// if err != nil {
@@ -235,7 +201,7 @@ func (rc *Controller) enqueueAll() {
 	rq.queue.Add(key)
 }*/
 
-// FGI TODO: This may not be needed if we have an initial mechanism to setup all the monitors. This should not change aftewards
+// FGI TODO: This may not be needed if we have an initial mechanism to setup all the monitors. This should not change afterwards
 /* func (rq *Controller) addQuota(obj interface{}) {
 	key, err := controller.KeyFunc(obj)
 	if err != nil {
@@ -336,24 +302,25 @@ func (rc *Controller) enqueueAll() {
 // FGI TODO: this is based on the quota entity. I need to amend it so that my own structure is used instead
 // I should be able to use a similar key: namespace + name.
 // FGI HERE!!!
-func (rc *Controller) syncResourceUsageFromKey(key string) (err error) {
+func (ru *Controller) syncResourceUsageFromKey(key string) (err error) {
 	startTime := time.Now()
 	defer func() {
 		klog.V(4).Infof("Finished syncing resource usage %q (%v)", key, time.Since(startTime))
 	}()
 
-	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	/* namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return err
-	}
+	}*/
 	// I will replace that with my own structure
 	// also depending on the resource I may want to report it at cluster or namespace level
 	// lastNotifiedValue =  <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<=================================================
 
-	// FGI TODO It will be the recalculation of what I have called a Measurer. A measurer is specific to a resource
+	// FGI TODO It will be the recalculation of what I have called an Evaluator. An evaluator is specific to a resource
 	// and may or may not be namespaced so that I will need to pass the namespace as a parameter
-	// I will merge the code of syncResourceQuota here
-	return rc.syncResourceQuota(resourceQuota)
+	// I will merge the code of syncResourceUsage here
+	// return ru.syncResourceUsage(resourceQuota)
+	return nil
 }
 
 // syncResourceQuota runs a complete sync of resource quota status across all known kinds
@@ -514,23 +481,6 @@ func (rc *Controller) replenishUsage(groupResource schema.GroupResource, namespa
 		klog.V(2).Infof("synced quota controller")
 	}, period, stopCh)
 }*/
-
-// printDiff returns a human-readable summary of what resources were added and removed
-func printDiff(oldResources, newResources map[schema.GroupVersionResource]struct{}) string {
-	removed := sets.NewString()
-	for oldResource := range oldResources {
-		if _, ok := newResources[oldResource]; !ok {
-			removed.Insert(fmt.Sprintf("%+v", oldResource))
-		}
-	}
-	added := sets.NewString()
-	for newResource := range newResources {
-		if _, ok := oldResources[newResource]; !ok {
-			added.Insert(fmt.Sprintf("%+v", newResource))
-		}
-	}
-	return fmt.Sprintf("added: %v, removed: %v", added.List(), removed.List())
-}
 
 // waitForStopOrTimeout returns a stop channel that closes when the provided stop channel closes or when the specified timeout is reached
 func waitForStopOrTimeout(stopCh <-chan struct{}, timeout time.Duration) <-chan struct{} {

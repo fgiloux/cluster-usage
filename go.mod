@@ -1,4 +1,4 @@
-module fgiloux/controller-tools
+module github.com/fgiloux/cluster-usage
 
 go 1.17
 
